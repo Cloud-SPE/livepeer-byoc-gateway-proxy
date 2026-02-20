@@ -1,0 +1,66 @@
+services:
+  orchestrator:
+    image: livepeer/go-livepeer:latest
+    container_name: byoc-orchestrator
+    volumes:
+      - ./data/orchestrator:/root/.lpData
+    command: >
+      -orchestrator
+      -serviceAddr=byoc-orchestrator:8935
+      -orchSecret=orch-secret
+      -cliAddr=byoc-orchestrator:7935
+      -pricePerUnit 250
+      -v 6
+      -ethOrchAddr=YOUR_ORCH_ETH_ADDR
+      -network=arbitrum-one-mainnet
+      -blockPollingInterval=10
+      -ethUrl=YOUR_ARB_RPC_ENDPOINT
+      -ethPassword=/root/.lpData/eth-secret.txt
+      -ethKeystorePath=/root/.lpData
+      -dataDir=/root/.lpData/tmp      
+
+  gateway:
+    image: livepeer/go-livepeer:latest
+    container_name: byoc-gateway
+    volumes:
+      - ./data/gateway:/root/.lpData
+    ports:
+      - 8935:8935
+    command: >
+      -gateway
+      -orchAddr=byoc-orchestrator:8935
+      -httpAddr=0.0.0.0:8935
+      -cliAddr=byoc-gateway:7935
+      -httpIngest=true
+      -v=9
+      -monitor
+      -network=arbitrum-one-mainnet
+      -blockPollingInterval=10
+      -ethUrl=YOUR_ARB_RPC
+      -ethPassword=/root/.lpData/eth-secret.txt
+      -ethKeystorePath=/root/.lpData
+      -dataDir=/root/.lpData/tmp
+    depends_on:
+      - orchestrator
+
+  # OpenAI proxy: public entry point behind Traefik
+  openai_gateway_proxy:
+    build: .
+    container_name: openai_gateway_proxy
+    environment:
+      - PROXY_ADDR=:8090
+      - GATEWAY_URL=http://gateway:8935
+      - CHAT_COMPLETIONS_CAPABILITY=openai-chat-completions
+      - IMAGE_GENERATION_CAPABILITY=openai-image-generation
+      - TEXT_EMBEDDINGS_CAPABILITY=openai-text-embeddings
+      - RERANK_CAPABILITY=cohere-rerank
+      - VIDEO_PIPELINE_GENERATION_CAPABILITY=video-generation
+      - CHAT_COMPLETIONS_TIMEOUT_SECONDS=120
+      - IMAGE_GENERATION_TIMEOUT_SECONDS=120
+      - TEXT_EMBEDDINGS_TIMEOUT_SECONDS=30
+      - RERANK_TIMEOUT_SECONDS=30
+      - VIDEO_PIPELINE_GENERATION_TIMEOUT_SECONDS=900
+    depends_on:
+      - gateway
+    ports:
+      - "8090:8090"
