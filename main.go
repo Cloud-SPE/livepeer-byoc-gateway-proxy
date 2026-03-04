@@ -29,17 +29,29 @@ func main() {
 	embeddingsCapability := env("TEXT_EMBEDDINGS_CAPABILITY", "openai-text-embeddings")
 	rerankCapability := env("RERANK_CAPABILITY", "cohere-rerank")
 	videoGenerationCapability := env("VIDEO_GENERATION_CAPABILITY", "video-generation")
+	transcodeCapability := env("BYOC_TRANSCODE_CAPABILITY", "video-transcode")
+	abrCapability := env("BYOC_ABR_CAPABILITY", "transcode-abr")
+	liveTranscodeCapability := env("BYOC_LIVE_TRANSCODE_CAPABILITY", "transcode-live")
 	timeoutSeconds := envInt("CHAT_COMPLETIONS_TIMEOUT_SECONDS", 120)
 	imageTimeoutSeconds := envInt("IMAGE_GENERATION_TIMEOUT_SECONDS", 120)
 	embeddingsTimeoutSeconds := envInt("TEXT_EMBEDDINGS_TIMEOUT_SECONDS", 30)
 	rerankTimeoutSeconds := envInt("RERANK_TIMEOUT_SECONDS", 30)
 	videoPipelineTimeoutSeconds := envInt("VIDEO_GENERATION_TIMEOUT_SECONDS", 900)
+	transcodeTimeoutSeconds := envInt("TRANSCODE_TIMEOUT_SECONDS", 900)
+	abrTimeoutSeconds := envInt("ABR_TIMEOUT_SECONDS", 1800)
+	liveTranscodeTimeoutSeconds := envInt("LIVE_TRANSCODE_TIMEOUT_SECONDS", 0) // 0 = no timeout for streams
 
 	target := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/chat/completions"
 	imageTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/images/generations"
 	embeddingsTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/embeddings"
 	rerankTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/rerank"
 	videoGenerationTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/generations"
+	transcodeTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode"
+	transcodeStatusTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode/status"
+	transcodePresetsTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode/presets"
+	abrTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode/abr"
+	abrStatusTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode/abr/status"
+	abrPresetsTarget := strings.TrimRight(gatewayURL, "/") + "/process/request/v1/video/transcode/abr/presets"
 
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -433,6 +445,632 @@ func main() {
 		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.blueclaw.network/api/v1/models", nil)
+		if err != nil {
+			http.Error(w, "failed to create models request", http.StatusInternalServerError)
+			return
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "models request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		var blueclawModels []struct {
+			ModelID   string `json:"model_id"`
+			Provider  string `json:"provider"`
+			Active    bool   `json:"active"`
+			CreatedAt string `json:"created_at"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&blueclawModels); err != nil {
+			http.Error(w, "failed to decode models response", http.StatusBadGateway)
+			return
+		}
+
+		type openAIModel struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		}
+		data := make([]openAIModel, 0, len(blueclawModels))
+		for _, m := range blueclawModels {
+			if !m.Active {
+				continue
+			}
+			var created int64
+			if t, err := time.Parse(time.RFC3339Nano, m.CreatedAt); err == nil {
+				created = t.Unix()
+			}
+			data = append(data, openAIModel{
+				ID:      m.ModelID,
+				Object:  "model",
+				Created: created,
+				OwnedBy: m.Provider,
+			})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   data,
+		})
+	})
+
+	// Video transcode submit endpoint — starts async transcode job
+	mux.HandleFunc("/v1/video/transcode", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 5 << 20 // 5MB
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, transcodeTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + transcodeCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      transcodeCapability,
+			"timeout_seconds": transcodeTimeoutSeconds,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+		log.Printf("transcode request to gateway: url=%s content_len=%d", transcodeTarget, len(bodyBytes))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Video transcode status endpoint — poll job progress
+	mux.HandleFunc("/v1/video/transcode/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, transcodeStatusTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + transcodeCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      transcodeCapability,
+			"timeout_seconds": 30,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Video transcode presets endpoint — list available presets
+	mux.HandleFunc("/v1/video/transcode/presets", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, r.Method, transcodePresetsTarget, nil)
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + transcodeCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      transcodeCapability,
+			"timeout_seconds": 30,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// ABR transcode submit endpoint — starts async ABR job
+	mux.HandleFunc("/v1/video/transcode/abr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 5 << 20 // 5MB
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, abrTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + abrCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      abrCapability,
+			"timeout_seconds": abrTimeoutSeconds,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+		log.Printf("ABR transcode request to gateway: url=%s content_len=%d", abrTarget, len(bodyBytes))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// ABR transcode status endpoint — poll per-rendition progress
+	mux.HandleFunc("/v1/video/transcode/abr/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, abrStatusTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + abrCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      abrCapability,
+			"timeout_seconds": 30,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// ── Live Transcode (Stream Model) ──────────────────────────────────────
+	// Live transcode uses /process/stream/... (Stream Model) instead of /process/request/...
+	liveStreamStartTarget := strings.TrimRight(gatewayURL, "/") + "/process/stream/start"
+
+	// Live transcode start — starts a live stream session
+	mux.HandleFunc("/v1/video/transcode/live/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, liveStreamStartTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":    `{"run":"` + liveTranscodeCapability + `"}`,
+			"parameters": `{"enable_video_ingress":true,"enable_video_egress":true,"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability": liveTranscodeCapability,
+		}
+		if liveTranscodeTimeoutSeconds > 0 {
+			lp["timeout_seconds"] = liveTranscodeTimeoutSeconds
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+		log.Printf("live transcode start request to gateway: url=%s content_len=%d", liveStreamStartTarget, len(bodyBytes))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Live transcode stop — stop a live stream
+	mux.HandleFunc("/v1/video/transcode/live/stop", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		// Extract stream_id from body to build gateway URL
+		var stopReq struct {
+			StreamID string `json:"stream_id"`
+		}
+		json.Unmarshal(bodyBytes, &stopReq)
+		if stopReq.StreamID == "" {
+			http.Error(w, `{"error":"stream_id is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		stopTarget := strings.TrimRight(gatewayURL, "/") + "/process/stream/" + stopReq.StreamID + "/stop"
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, stopTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":    `{"run":"` + liveTranscodeCapability + `"}`,
+			"parameters": `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability": liveTranscodeCapability,
+		}
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Live transcode update — update stream params mid-stream
+	mux.HandleFunc("/v1/video/transcode/live/update", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		var updateReq struct {
+			StreamID string `json:"stream_id"`
+		}
+		json.Unmarshal(bodyBytes, &updateReq)
+		if updateReq.StreamID == "" {
+			http.Error(w, `{"error":"stream_id is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		updateTarget := strings.TrimRight(gatewayURL, "/") + "/process/stream/" + updateReq.StreamID + "/update"
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, updateTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		req.ContentLength = int64(len(bodyBytes))
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":    `{"run":"` + liveTranscodeCapability + `"}`,
+			"parameters": `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability": liveTranscodeCapability,
+		}
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Live transcode status — get stream status
+	mux.HandleFunc("/v1/video/transcode/live/status", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		const maxBody = 1 << 20
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		_ = r.Body.Close()
+
+		var statusReq struct {
+			StreamID string `json:"stream_id"`
+		}
+		json.Unmarshal(bodyBytes, &statusReq)
+		if statusReq.StreamID == "" {
+			http.Error(w, `{"error":"stream_id is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		statusTarget := strings.TrimRight(gatewayURL, "/") + "/process/stream/" + statusReq.StreamID + "/status"
+
+		req, err := http.NewRequestWithContext(ctx, r.Method, statusTarget, bytes.NewReader(bodyBytes))
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+		if len(bodyBytes) > 0 {
+			req.ContentLength = int64(len(bodyBytes))
+		}
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":    `{"run":"` + liveTranscodeCapability + `"}`,
+			"parameters": `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability": liveTranscodeCapability,
+		}
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// ABR transcode presets endpoint — list available ABR presets
+	mux.HandleFunc("/v1/video/transcode/abr/presets", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, r.Method, abrPresetsTarget, nil)
+		if err != nil {
+			http.Error(w, "failed to create gateway request", http.StatusBadGateway)
+			return
+		}
+
+		copyHeader(req.Header, r.Header, []string{"Content-Type", "Accept"})
+		req.Header.Del("Authorization")
+
+		lp := map[string]any{
+			"request":         `{"run":"` + abrCapability + `"}`,
+			"parameters":      `{"orchestrators":{"include":[],"exclude":[]}}`,
+			"capability":      abrCapability,
+			"timeout_seconds": 30,
+		}
+
+		b, _ := json.Marshal(lp)
+		req.Header.Set("Livepeer", base64.StdEncoding.EncodeToString(b))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "gateway request failed: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		copyAllHeaders(w.Header(), resp.Header)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Del("Livepeer-Balance")
+		w.Header().Del("X-Metadata")
+		w.Header().Del("X-Orchestrator-Url")
+		w.WriteHeader(resp.StatusCode)
+
+		io.Copy(w, resp.Body)
+	})
+
+	// Models endpoint — fetches from api.blueclaw.network and reshapes to OpenAI format
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.blueclaw.network/v1/models", nil)
 		if err != nil {
 			http.Error(w, "failed to create models request", http.StatusInternalServerError)
 			return
