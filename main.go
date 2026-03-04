@@ -439,65 +439,6 @@ func main() {
 		io.Copy(w, resp.Body)
 	})
 
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.blueclaw.network/api/v1/models", nil)
-		if err != nil {
-			http.Error(w, "failed to create models request", http.StatusInternalServerError)
-			return
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			http.Error(w, "models request failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		var blueclawModels []struct {
-			ModelID   string `json:"model_id"`
-			Provider  string `json:"provider"`
-			Active    bool   `json:"active"`
-			CreatedAt string `json:"created_at"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&blueclawModels); err != nil {
-			http.Error(w, "failed to decode models response", http.StatusBadGateway)
-			return
-		}
-
-		type openAIModel struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
-		}
-		data := make([]openAIModel, 0, len(blueclawModels))
-		for _, m := range blueclawModels {
-			if !m.Active {
-				continue
-			}
-			var created int64
-			if t, err := time.Parse(time.RFC3339Nano, m.CreatedAt); err == nil {
-				created = t.Unix()
-			}
-			data = append(data, openAIModel{
-				ID:      m.ModelID,
-				Object:  "model",
-				Created: created,
-				OwnedBy: m.Provider,
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"object": "list",
-			"data":   data,
-		})
-	})
-
 	// Video transcode submit endpoint — starts async transcode job
 	mux.HandleFunc("/v1/video/transcode", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
